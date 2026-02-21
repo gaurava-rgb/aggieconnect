@@ -84,7 +84,7 @@ async function fetchAll() {
         pm2List(),
         sb.from('requests').select('request_type, request_status, created_at'),
         sb.from('matches').select('id', { count: 'exact', head: true }),
-        sb.from('monitored_groups').select('name, group_id, active').order('name'),
+        sb.from('monitored_groups').select('group_name, group_id, active').order('group_name'),
         sb.from('message_log')
             .select('created_at, source_group, message_text, is_request, parsed_data, error')
             .order('created_at', { ascending: false })
@@ -166,7 +166,7 @@ async function buildReport() {
     ln('  [x] = monitored    [ ] = known but inactive');
     ln('');
     for (const g of groups) {
-        ln(`  ${g.active ? '[x]' : '[ ]'} ${g.name || g.group_id}`);
+        ln(`  ${g.active ? '[x]' : '[ ]'} ${g.group_name || g.group_id}`);
     }
 
     // ── database ──
