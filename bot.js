@@ -153,6 +153,7 @@ async function backfillOnReady(chats) {
 }
 
 let client = createClient();
+let isReady = false;
 
 client.on('qr', (qr) => {
     console.log('\n=== Scan this QR code with WhatsApp ===\n');
@@ -162,6 +163,7 @@ client.on('qr', (qr) => {
 
 client.on('ready', async () => {
     reconnectAttempts = 0;
+    isReady = true;
     console.log('\n[Bot] Connected to WhatsApp!');
 
     // Seed all WhatsApp groups into monitored_groups table (inactive by default)
@@ -235,7 +237,25 @@ setInterval(async () => {
     }
 }, GROUP_POLL_INTERVAL);
 
+// Watchdog: detect silent WebSocket drops (zombie state) every 5 minutes.
+// Exits so pm2 auto-restarts the process cleanly (re-connects + runs backfill).
+const WATCHDOG_INTERVAL = 5 * 60 * 1000;
+setInterval(async () => {
+    if (!isReady) return;
+    try {
+        const state = await client.getState();
+        if (state !== 'CONNECTED') {
+            console.error(`[Bot] Watchdog: state is "${state}" — exiting for pm2 restart`);
+            process.exit(1);
+        }
+    } catch (err) {
+        console.error(`[Bot] Watchdog: getState() threw — exiting for pm2 restart (${err.message})`);
+        process.exit(1);
+    }
+}, WATCHDOG_INTERVAL);
+
 client.on('disconnected', async (reason) => {
+    isReady = false;
     console.log(`\n[Bot] Disconnected: ${reason}`);
 
     if (reconnectAttempts < MAX_RECONNECT) {
