@@ -120,6 +120,7 @@ async function backfillOnReady(chats) {
 
     for (const chat of monitoredChats) {
         try {
+            try { await chat.syncHistory(); } catch {}
             const messages = await chat.fetchMessages({ limit: BACKFILL_LIMIT });
             const recent = messages.filter(m => m.timestamp * 1000 >= since && m.body && m.body.length >= 3);
             totalFetched += recent.length;

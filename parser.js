@@ -41,11 +41,18 @@ When you detect a valid request or offer, return:
   }
 }
 
-Common patterns:
+isRequest = true for BOTH needs (looking for a ride) AND offers (providing a ride).
+isRequest = false ONLY for casual chat (greetings, reactions, replies, thank yous).
+
+Common patterns (all return isRequest: true):
 - "anyone going to Houston?" -> need, ride
 - "can drop 2 people to DFW" -> offer, ride
 - "need ride to IAH Friday" -> need, ride
 - "driving to Dallas, 3 spots" -> offer, ride
+- "Ride available from CS to Dallas" -> offer, ride
+- "Ride available tomorrow to Houston" -> offer, ride
+- "giving ride to Houston Friday" -> offer, ride
+- "offering ride to DFW this weekend" -> offer, ride
 - "need help moving" -> need, help
 - "can help with groceries" -> offer, help
 
