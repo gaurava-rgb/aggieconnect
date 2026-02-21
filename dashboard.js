@@ -48,10 +48,12 @@ async function getTrips() {
 }
 
 async function getOpenRequests() {
+    const today = new Date().toISOString().split('T')[0];
     const { data } = await supabase
         .from('requests')
         .select('*')
         .eq('request_status', 'open')
+        .or(`ride_plan_date.gte.${today},ride_plan_date.is.null`)
         .order('ride_plan_date', { ascending: true });
     return data || [];
 }
@@ -388,13 +390,13 @@ app.get('/', async (req, res) => {
   </div>
 
   <div class="section">
-    <div class="section-title">Matched Needs — No Driver Yet (${needClusters.length})</div>
+    <div class="section-title">Matched Trips — No Ride Yet (${needClusters.length})</div>
     ${needClusters.length === 0 ? '<div class="empty">No unmatched need clusters right now</div>' : needClusters.map(c => {
         return `<div class="cluster-card">
           <div class="cluster-header">
             <div>
               <div class="cluster-route">${escHtml(c.origin)} → ${escHtml(c.destination)}</div>
-              <div class="cluster-people">${c.contacts.length} people looking — no driver yet</div>
+              <div class="cluster-people">${c.contacts.length} people looking — no ride yet</div>
             </div>
             <div>
               <span class="cluster-badge">${formatDate(c.date)}</span>
