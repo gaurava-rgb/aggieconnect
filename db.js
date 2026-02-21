@@ -2,16 +2,61 @@
  * Supabase Database Client
  */
 
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const { normalizeLocation } = require('./normalize');
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY
 );
 
-/**
- * Log every message the bot sees (for auditing)
- */
+// ============================================================
+// Monitored Groups
+// ============================================================
+
+async function loadMonitoredGroups() {
+    const { data, error } = await supabase
+        .from('monitored_groups')
+        .select('group_id, group_name')
+        .eq('active', true);
+
+    if (error) {
+        console.error('[DB] Error loading monitored groups:', error.message);
+        return [];
+    }
+    return data || [];
+}
+
+async function getGroupUpdates(since) {
+    const { data, error } = await supabase
+        .from('monitored_groups')
+        .select('updated_at')
+        .gt('updated_at', since.toISOString())
+        .limit(1);
+
+    if (error) {
+        console.error('[DB] Error checking group updates:', error.message);
+        return false;
+    }
+    return data && data.length > 0;
+}
+
+async function seedGroups(groups) {
+    for (const g of groups) {
+        await supabase
+            .from('monitored_groups')
+            .upsert(
+                { group_id: g.id, group_name: g.name },
+                { onConflict: 'group_id', ignoreDuplicates: true }
+            );
+    }
+}
+
+// ============================================================
+// Message Log
+// ============================================================
+
 async function logMessage({ sourceGroup, sourceContact, senderName, messageText, isRequest, parsedData, error }) {
     try {
         await supabase.from('message_log').insert({
@@ -28,24 +73,70 @@ async function logMessage({ sourceGroup, sourceContact, senderName, messageText,
     }
 }
 
-/**
- * Save a new request (need or offer)
- */
+// ============================================================
+// Request Dedup
+// ============================================================
+
+function computeRequestHash({ sourceContact, type, category, destination, date }) {
+    const normDest = normalizeLocation(destination) || '';
+    const parts = [
+        sourceContact || '',
+        type || '',
+        category || '',
+        normDest.toLowerCase(),
+        date || ''
+    ].join('|');
+    return crypto.createHash('sha256').update(parts).digest('hex').substring(0, 16);
+}
+
+async function findExistingRequest(hash) {
+    const { data } = await supabase
+        .from('requests')
+        .select('id, source_group')
+        .eq('request_hash', hash)
+        .eq('request_status', 'open')
+        .limit(1)
+        .single();
+    return data;
+}
+
+// ============================================================
+// Save Request (with dedup)
+// ============================================================
+
 async function saveRequest(data) {
+    const hash = computeRequestHash({
+        sourceContact: data.sourceContact,
+        type: data.type,
+        category: data.category,
+        destination: data.destination,
+        date: data.date
+    });
+
+    const existing = await findExistingRequest(hash);
+    if (existing) {
+        console.log(`[DB] Duplicate request (matches ${existing.id} from ${existing.source_group}), skipping`);
+        return null;
+    }
+
+    const normOrigin = normalizeLocation(data.origin);
+    const normDest = normalizeLocation(data.destination);
+
     const { data: request, error } = await supabase
         .from('requests')
         .insert({
             source: data.source || 'whatsapp',
             source_group: data.sourceGroup,
             source_contact: data.sourceContact,
-            type: data.type,
-            category: data.category,
-            date: data.date,
-            origin: data.origin,
-            destination: data.destination,
-            details: data.details || {},
+            request_type: data.type,
+            request_category: data.category,
+            ride_plan_date: data.date,
+            request_origin: normOrigin,
+            request_destination: normDest,
+            request_details: data.details || {},
             raw_message: data.rawMessage,
-            status: 'open'
+            request_status: 'open',
+            request_hash: hash
         })
         .select()
         .single();
@@ -59,34 +150,35 @@ async function saveRequest(data) {
     return request;
 }
 
-/**
- * Find potential matches for a request
- */
+// ============================================================
+// Matching
+// ============================================================
+
 async function findMatches(request) {
-    const oppositeType = request.type === 'need' ? 'offer' : 'need';
+    const oppositeType = request.request_type === 'need' ? 'offer' : 'need';
 
     let query = supabase
         .from('requests')
         .select('*')
-        .eq('category', request.category)
-        .eq('type', oppositeType)
-        .eq('status', 'open')
+        .eq('request_category', request.request_category)
+        .eq('request_type', oppositeType)
+        .eq('request_status', 'open')
         .neq('id', request.id);
 
-    if (request.category === 'ride' && request.destination) {
-        query = query.eq('destination', request.destination);
+    if (request.request_category === 'ride' && request.request_destination) {
+        query = query.eq('request_destination', request.request_destination);
     }
 
-    if (request.date) {
-        const date = new Date(request.date);
+    if (request.ride_plan_date) {
+        const date = new Date(request.ride_plan_date);
         const dayBefore = new Date(date);
         const dayAfter = new Date(date);
         dayBefore.setDate(date.getDate() - 1);
         dayAfter.setDate(date.getDate() + 1);
 
         query = query
-            .gte('date', dayBefore.toISOString().split('T')[0])
-            .lte('date', dayAfter.toISOString().split('T')[0]);
+            .gte('ride_plan_date', dayBefore.toISOString().split('T')[0])
+            .lte('ride_plan_date', dayAfter.toISOString().split('T')[0]);
     }
 
     const { data: matches, error } = await query;
@@ -99,9 +191,6 @@ async function findMatches(request) {
     return matches || [];
 }
 
-/**
- * Save a match between two requests
- */
 async function saveMatch(needId, offerId, score = 1.0) {
     const { data: existing } = await supabase
         .from('matches')
@@ -129,33 +218,38 @@ async function saveMatch(needId, offerId, score = 1.0) {
 
     await supabase
         .from('requests')
-        .update({ status: 'matched' })
+        .update({ request_status: 'matched' })
         .in('id', [needId, offerId]);
 
     console.log(`[DB] Match created: ${match.id}`);
     return match;
 }
 
-/**
- * Get stats
- */
+// ============================================================
+// Stats
+// ============================================================
+
 async function getStats() {
     const { data: requests } = await supabase
         .from('requests')
-        .select('type, category, status');
+        .select('request_type, request_category, request_status');
 
     return {
         total: requests?.length || 0,
-        needs: requests?.filter(r => r.type === 'need').length || 0,
-        offers: requests?.filter(r => r.type === 'offer').length || 0,
-        open: requests?.filter(r => r.status === 'open').length || 0,
-        matched: requests?.filter(r => r.status === 'matched').length || 0
+        needs: requests?.filter(r => r.request_type === 'need').length || 0,
+        offers: requests?.filter(r => r.request_type === 'offer').length || 0,
+        open: requests?.filter(r => r.request_status === 'open').length || 0,
+        matched: requests?.filter(r => r.request_status === 'matched').length || 0
     };
 }
 
 module.exports = {
     supabase,
+    loadMonitoredGroups,
+    getGroupUpdates,
+    seedGroups,
     logMessage,
+    computeRequestHash,
     saveRequest,
     findMatches,
     saveMatch,

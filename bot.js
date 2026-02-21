@@ -1,6 +1,10 @@
 /**
  * Aggie Connect - WhatsApp Bot
  * Listens to group messages, parses with LLM, stores in Supabase, finds matches
+ *
+ * Group monitoring is managed via the monitored_groups table in Supabase.
+ * Toggle groups active/inactive in the Table Editor - the bot picks up
+ * changes within 60 seconds, no restart needed.
  */
 
 require('dotenv').config();
@@ -8,13 +12,12 @@ require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { parseMessage } = require('./parser');
-const { saveRequest, logMessage, getStats } = require('./db');
+const { saveRequest, logMessage, getStats, loadMonitoredGroups, getGroupUpdates, seedGroups } = require('./db');
 const { processRequest, formatMatch } = require('./matcher');
 
-const TARGET_GROUPS = (process.env.TARGET_GROUPS || '')
-    .split(',')
-    .map(g => g.trim())
-    .filter(Boolean);
+const monitoredGroupIds = new Set();
+let lastGroupCheck = new Date();
+const GROUP_POLL_INTERVAL = 60 * 1000;
 
 const processedMessages = new Set();
 let reconnectAttempts = 0;
@@ -36,37 +39,54 @@ function createClient() {
     });
 }
 
+async function refreshMonitoredGroups() {
+    const groups = await loadMonitoredGroups();
+    monitoredGroupIds.clear();
+    groups.forEach(g => monitoredGroupIds.add(g.group_id));
+    return groups.length;
+}
+
 let client = createClient();
 
-// QR Code
 client.on('qr', (qr) => {
     console.log('\n=== Scan this QR code with WhatsApp ===\n');
     qrcode.generate(qr, { small: true });
     console.log('Open WhatsApp > Settings > Linked Devices > Link a Device\n');
 });
 
-// Connected
 client.on('ready', async () => {
     reconnectAttempts = 0;
     console.log('\n[Bot] Connected to WhatsApp!');
 
-    if (TARGET_GROUPS.length === 0) {
-        console.log('\n[Bot] No TARGET_GROUPS configured. Listing groups:\n');
-        const chats = await client.getChats();
-        chats.filter(c => c.isGroup).forEach(g => {
-            console.log(`  ${g.name}`);
-            console.log(`    ID: ${g.id._serialized}\n`);
-        });
-        console.log('Add group IDs to TARGET_GROUPS in .env\n');
+    // Seed all WhatsApp groups into monitored_groups table (inactive by default)
+    const chats = await client.getChats();
+    const waGroups = chats.filter(c => c.isGroup).map(g => ({
+        id: g.id._serialized,
+        name: g.name
+    }));
+    await seedGroups(waGroups);
+
+    // Load active monitored groups from DB
+    const count = await refreshMonitoredGroups();
+    lastGroupCheck = new Date();
+
+    console.log(`\n[Bot] Available groups (${waGroups.length}):\n`);
+    waGroups.forEach(g => {
+        const monitored = monitoredGroupIds.has(g.id);
+        console.log(`  ${monitored ? '[monitoring] ' : ''}${g.name}`);
+        console.log(`    ID: ${g.id}\n`);
+    });
+
+    if (monitoredGroupIds.size === 0) {
+        console.log('[Bot] No active groups in DB - monitoring nothing. Activate groups in Supabase.\n');
     } else {
-        console.log(`[Bot] Monitoring ${TARGET_GROUPS.length} group(s)`);
+        console.log(`[Bot] Monitoring ${count} group(s) (from DB)\n`);
     }
 
     const stats = await getStats();
     console.log(`[Bot] DB: ${stats.total} requests (${stats.open} open, ${stats.matched} matched)\n`);
 });
 
-// Message handler
 client.on('message', async (msg) => {
     try {
         if (processedMessages.has(msg.id._serialized)) return;
@@ -76,21 +96,19 @@ client.on('message', async (msg) => {
         if (!chat.isGroup) return;
 
         const groupId = chat.id._serialized;
-        if (TARGET_GROUPS.length > 0 && !TARGET_GROUPS.includes(groupId)) return;
+        if (monitoredGroupIds.size > 0 && !monitoredGroupIds.has(groupId)) return;
 
         const contact = await msg.getContact();
         const senderName = contact.pushname || contact.name || 'Unknown';
-        const senderNumber = msg.author || msg.from;
+        const senderNumber = contact.id?.user || msg.author || msg.from;
         const body = msg.body;
 
         if (!body || body.length < 3) return;
 
         console.log(`\n[${chat.name}] ${senderName}: ${body.substring(0, 60)}${body.length > 60 ? '...' : ''}`);
 
-        // Parse with LLM
         const parsed = await parseMessage(body, senderName);
 
-        // Log every message
         await logMessage({
             sourceGroup: chat.name,
             sourceContact: senderNumber,
@@ -106,7 +124,6 @@ client.on('message', async (msg) => {
             return;
         }
 
-        // Save to database
         const request = await saveRequest({
             source: 'whatsapp',
             sourceGroup: chat.name,
@@ -121,11 +138,9 @@ client.on('message', async (msg) => {
         });
 
         if (!request) {
-            console.log('[Bot] Failed to save');
             return;
         }
 
-        // Find matches
         const matches = await processRequest(request);
 
         if (matches.length > 0) {
@@ -138,7 +153,20 @@ client.on('message', async (msg) => {
     }
 });
 
-// Auto-reconnect
+// Poll for group monitoring changes every 60s
+setInterval(async () => {
+    try {
+        const hasChanges = await getGroupUpdates(lastGroupCheck);
+        if (hasChanges) {
+            const count = await refreshMonitoredGroups();
+            console.log(`[Bot] Group list updated: now monitoring ${count} group(s)`);
+        }
+        lastGroupCheck = new Date();
+    } catch (err) {
+        console.error('[Bot] Group poll error:', err.message);
+    }
+}, GROUP_POLL_INTERVAL);
+
 client.on('disconnected', async (reason) => {
     console.log(`\n[Bot] Disconnected: ${reason}`);
 
@@ -149,7 +177,6 @@ client.on('disconnected', async (reason) => {
         setTimeout(() => {
             client.destroy().then(() => {
                 client = createClient();
-                bindEvents();
                 client.initialize();
             });
         }, delay * 1000);
@@ -165,12 +192,10 @@ client.on('auth_failure', (msg) => {
     process.exit(1);
 });
 
-// Cleanup old message IDs periodically
 setInterval(() => {
     if (processedMessages.size > 10000) processedMessages.clear();
 }, 60 * 60 * 1000);
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n[Bot] Shutting down...');
     await client.destroy();
@@ -185,7 +210,6 @@ process.on('unhandledRejection', (err) => {
     console.error('[Bot] Unhandled rejection:', err.message || err);
 });
 
-// Start
 console.log('\n=== Aggie Connect Bot ===\n');
 console.log('Initializing...\n');
 client.initialize();

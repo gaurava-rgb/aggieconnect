@@ -3,9 +3,10 @@
  */
 
 const db = require('./db');
+const { normalizeLocation } = require('./normalize');
 
 async function processRequest(request) {
-    console.log(`[Matcher] Processing ${request.type} for ${request.category}`);
+    console.log(`[Matcher] Processing ${request.request_type} for ${request.request_category}`);
 
     const potentialMatches = await db.findMatches(request);
 
@@ -22,15 +23,15 @@ async function processRequest(request) {
         const score = calculateScore(request, match);
         if (score < 0.5) continue;
 
-        const needId = request.type === 'need' ? request.id : match.id;
-        const offerId = request.type === 'offer' ? request.id : match.id;
+        const needId = request.request_type === 'need' ? request.id : match.id;
+        const offerId = request.request_type === 'offer' ? request.id : match.id;
 
         const saved = await db.saveMatch(needId, offerId, score);
         if (saved) {
             savedMatches.push({
                 match: saved,
-                need: request.type === 'need' ? request : match,
-                offer: request.type === 'offer' ? request : match
+                need: request.request_type === 'need' ? request : match,
+                offer: request.request_type === 'offer' ? request : match
             });
         }
     }
@@ -45,23 +46,23 @@ async function processRequest(request) {
 function calculateScore(request, match) {
     let score = 1.0;
 
-    if (request.date && match.date) {
+    if (request.ride_plan_date && match.ride_plan_date) {
         const daysDiff = Math.abs(
-            (new Date(request.date) - new Date(match.date)) / (1000 * 60 * 60 * 24)
+            (new Date(request.ride_plan_date) - new Date(match.ride_plan_date)) / (1000 * 60 * 60 * 24)
         );
         if (daysDiff === 0) score *= 1.0;
         else if (daysDiff === 1) score *= 0.8;
         else score *= 0.5;
     }
 
-    if (request.category === 'ride' && request.destination && match.destination) {
-        if (normalize(request.destination) === normalize(match.destination)) {
+    if (request.request_category === 'ride' && request.request_destination && match.request_destination) {
+        if (normalizeLocation(request.request_destination) === normalizeLocation(match.request_destination)) {
             score *= 1.0;
         } else {
             score *= 0.6;
         }
 
-        if (request.origin && match.origin && normalize(request.origin) === normalize(match.origin)) {
+        if (request.request_origin && match.request_origin && normalizeLocation(request.request_origin) === normalizeLocation(match.request_origin)) {
             score = Math.min(score * 1.1, 1.0);
         }
     }
@@ -69,31 +70,16 @@ function calculateScore(request, match) {
     return score;
 }
 
-function normalize(location) {
-    if (!location) return '';
-    const s = location.toLowerCase().trim();
-    const map = {
-        'houston iah': ['iah', 'bush', 'george bush', 'houston airport', 'houston intl'],
-        'houston hobby': ['hobby', 'hou'],
-        'dallas dfw': ['dfw', 'dallas airport', 'dallas/fort worth'],
-        'college station': ['cs', 'cstat', 'c station']
-    };
-    for (const [standard, variants] of Object.entries(map)) {
-        if (variants.some(v => s.includes(v)) || s.includes(standard)) return standard;
-    }
-    return s;
-}
-
 function formatMatch(matchData) {
     const { need, offer } = matchData;
     let msg = 'Match Found!\n\n';
-    if (need.category === 'ride') {
-        msg += `Ride to ${need.destination || 'TBD'}\n`;
-        msg += `Date: ${need.date || 'Flexible'}\n\n`;
+    if (need.request_category === 'ride') {
+        msg += `Ride to ${need.request_destination || 'TBD'}\n`;
+        msg += `Date: ${need.ride_plan_date || 'Flexible'}\n\n`;
         msg += `Looking: ${need.source_contact}\n`;
         msg += `Offering: ${offer.source_contact}\n`;
     } else {
-        msg += `${need.category}: ${need.details?.description || 'Help needed'}\n\n`;
+        msg += `${need.request_category}: ${need.request_details?.description || 'Help needed'}\n\n`;
         msg += `Needs help: ${need.source_contact}\n`;
         msg += `Can help: ${offer.source_contact}\n`;
     }
