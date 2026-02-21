@@ -39,9 +39,12 @@ async function getTrips() {
             score: m.score
         });
     }
-    return Object.values(grouped).sort((a, b) =>
-        new Date(a.offer.ride_plan_date || 0) - new Date(b.offer.ride_plan_date || 0)
-    );
+    const today = new Date().toISOString().split('T')[0];
+    return Object.values(grouped)
+        .filter(t => !t.offer.ride_plan_date || t.offer.ride_plan_date >= today)
+        .sort((a, b) =>
+            new Date(a.offer.ride_plan_date || 0) - new Date(b.offer.ride_plan_date || 0)
+        );
 }
 
 async function getOpenRequests() {
@@ -94,6 +97,38 @@ async function getDemand() {
     return byDate;
 }
 
+async function getUnmatchedNeedClusters() {
+    const today = new Date().toISOString().split('T')[0];
+    const { data: rows } = await supabase
+        .from('requests')
+        .select('ride_plan_date, request_origin, request_destination, source_contact')
+        .eq('request_type', 'need')
+        .eq('request_status', 'open')
+        .not('ride_plan_date', 'is', null)
+        .gte('ride_plan_date', today)
+        .order('ride_plan_date', { ascending: true });
+
+    const grouped = {};
+    for (const r of (rows || [])) {
+        const dest = r.request_destination || '?';
+        const orig = r.request_origin || '?';
+        const key = r.ride_plan_date + '|' + orig + '|' + dest;
+        if (!grouped[key]) {
+            grouped[key] = {
+                date: r.ride_plan_date,
+                origin: orig,
+                destination: dest,
+                contacts: []
+            };
+        }
+        if (r.source_contact) grouped[key].contacts.push(r.source_contact);
+    }
+
+    return Object.values(grouped)
+        .filter(g => g.contacts.length >= 2)
+        .sort((a, b) => a.date.localeCompare(b.date) || b.contacts.length - a.contacts.length);
+}
+
 async function getStats() {
     const { data: requests } = await supabase
         .from('requests')
@@ -136,6 +171,30 @@ function escHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function redactPhone(phone) {
+    if (!phone) return '';
+    const s = String(phone).trim();
+    const digits = s.replace(/\D/g, '');
+    if (digits.length <= 3) return s;
+    const prefix = s.startsWith('+') ? '+' : '';
+    const shown = digits.slice(0, 2) + '*'.repeat(digits.length - 3) + digits.slice(-1);
+    return prefix + shown;
+}
+
+function redactName(name) {
+    if (!name) return '';
+    const s = String(name).trim();
+    if (s.length <= 2) return s;
+    return s[0] + '*'.repeat(s.length - 2) + s[s.length - 1];
+}
+
+function redactContact(contact) {
+    if (!contact) return '';
+    const s = String(contact).trim();
+    if (/^\+?\d[\d\s\-]{5,}/.test(s)) return redactPhone(s);
+    return redactName(s);
+}
+
 function classifyRiders(riders, offerDate) {
     const exact = [];
     const nearby = [];
@@ -161,8 +220,8 @@ function findDuplicateContacts(riders) {
 
 app.get('/', async (req, res) => {
     try {
-        const [trips, openReqs, stats, demandByDate] = await Promise.all([
-            getTrips(), getOpenRequests(), getStats(), getDemand()
+        const [trips, openReqs, stats, demandByDate, needClusters] = await Promise.all([
+            getTrips(), getOpenRequests(), getStats(), getDemand(), getUnmatchedNeedClusters()
         ]);
 
         const openNeeds = openReqs.filter(r => r.request_type === 'need');
@@ -223,6 +282,12 @@ app.get('/', async (req, res) => {
   .req-date { font-size: 13px; color: #666; background: #f0f0f0; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
   .badge-need { border-left: 3px solid #3b82f6; }
   .badge-offer { border-left: 3px solid #22c55e; }
+  .cluster-card { background: #fff; border: 1px solid #e5e5e5; border-left: 3px solid #f59e0b; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+  .cluster-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
+  .cluster-route { font-size: 16px; font-weight: 600; }
+  .cluster-badge { font-size: 12px; color: #b45309; background: #fef3c7; padding: 2px 10px; border-radius: 4px; font-weight: 500; }
+  .cluster-people { font-size: 13px; color: #555; }
+  .cluster-contact { padding: 3px 0; font-size: 13px; color: #333; }
   .empty { color: #aaa; font-size: 14px; padding: 24px; text-align: center; }
   .refresh { float: right; font-size: 12px; color: #888; text-decoration: none; border: 1px solid #ddd; padding: 4px 12px; border-radius: 4px; }
   .refresh:hover { background: #f0f0f0; }
@@ -293,7 +358,7 @@ app.get('/', async (req, res) => {
             return '<div class="rider">' +
               '<span class="rider-contact">' +
                 '<span class="score score-' + tier + '"></span>' +
-                escHtml(r.source_contact) +
+                escHtml(redactContact(r.source_contact)) +
                 (originDiff ? '<span class="rider-origin-diff">from ' + escHtml(originDiff) + '</span>' : '') +
                 (isDup ? '<span class="dup-tag">dup?</span>' : '') +
               '</span>' +
@@ -308,7 +373,7 @@ app.get('/', async (req, res) => {
       <div class="trip-header">
         <div>
           <div class="trip-dest">${escHtml(o.request_origin || '?')} → ${escHtml(o.request_destination || '?')}</div>
-          <div class="trip-driver">Driver: <strong>${escHtml(o.source_contact)}</strong></div>
+          <div class="trip-driver">Driver: <strong>${escHtml(redactContact(o.source_contact))}</strong></div>
           ${time ? `<div class="trip-time">${escHtml(time)}</div>` : ''}
         </div>
         <div class="trip-date">${formatDate(o.ride_plan_date)}</div>
@@ -323,6 +388,26 @@ app.get('/', async (req, res) => {
   </div>
 
   <div class="section">
+    <div class="section-title">Matched Needs — No Driver Yet (${needClusters.length})</div>
+    ${needClusters.length === 0 ? '<div class="empty">No unmatched need clusters right now</div>' : needClusters.map(c => {
+        return `<div class="cluster-card">
+          <div class="cluster-header">
+            <div>
+              <div class="cluster-route">${escHtml(c.origin)} → ${escHtml(c.destination)}</div>
+              <div class="cluster-people">${c.contacts.length} people looking — no driver yet</div>
+            </div>
+            <div>
+              <span class="cluster-badge">${formatDate(c.date)}</span>
+            </div>
+          </div>
+          <div style="border-top:1px solid #f0f0f0;padding-top:8px;margin-top:4px">
+            ${c.contacts.map(ct => '<div class="cluster-contact">' + escHtml(redactContact(ct)) + '</div>').join('')}
+          </div>
+        </div>`;
+    }).join('')}
+  </div>
+
+  <div class="section">
     <div class="section-title">Open Requests</div>
     <div class="two-col">
       <div>
@@ -332,7 +417,7 @@ app.get('/', async (req, res) => {
             <div class="req-item badge-need">
               <div class="req-info">
                 <div class="req-route">${escHtml(r.request_origin || '?')} → ${escHtml(r.request_destination || '?')}</div>
-                <div class="req-meta">${escHtml(r.source_contact)} · ${escHtml(r.source_group || '')}</div>
+                <div class="req-meta">${escHtml(redactContact(r.source_contact))} · ${escHtml(r.source_group || '')}</div>
               </div>
               <div class="req-date">${formatDate(r.ride_plan_date)}</div>
             </div>`).join('')}
@@ -345,7 +430,7 @@ app.get('/', async (req, res) => {
             <div class="req-item badge-offer">
               <div class="req-info">
                 <div class="req-route">${escHtml(r.request_origin || '?')} → ${escHtml(r.request_destination || '?')}</div>
-                <div class="req-meta">${escHtml(r.source_contact)} · ${escHtml(r.source_group || '')}</div>
+                <div class="req-meta">${escHtml(redactContact(r.source_contact))} · ${escHtml(r.source_group || '')}</div>
               </div>
               <div class="req-date">${formatDate(r.ride_plan_date)}</div>
             </div>`).join('')}
