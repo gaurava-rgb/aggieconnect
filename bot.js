@@ -29,11 +29,25 @@ function createClient() {
         puppeteer: {
             headless: true,
             args: [
+                // Required for no-gui/root (wwebjs auth guide)
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
+                // Memory/stability (shared memory, GPU, rasterizer)
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
-                '--no-first-run'
+                '--disable-software-rasterizer',
+                // Reduce resource usage
+                '--disable-extensions',
+                '--disable-plugins',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--disable-translate',
+                // Headless/server optimizations
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--disable-infobars',
+                '--mute-audio',
+                '--hide-scrollbars'
             ]
         }
     });
