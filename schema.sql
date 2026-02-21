@@ -62,6 +62,7 @@ create table if not exists matches (
 -- ============================================================
 create table if not exists message_log (
   id uuid primary key default gen_random_uuid(),
+  wa_message_id text,
   source_group text,
   source_contact text,
   sender_name text,

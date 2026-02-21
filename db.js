@@ -57,9 +57,10 @@ async function seedGroups(groups) {
 // Message Log
 // ============================================================
 
-async function logMessage({ sourceGroup, sourceContact, senderName, messageText, isRequest, parsedData, error }) {
+async function logMessage({ waMessageId, sourceGroup, sourceContact, senderName, messageText, isRequest, parsedData, error }) {
     try {
         await supabase.from('message_log').insert({
+            wa_message_id: waMessageId || null,
             source_group: sourceGroup,
             source_contact: sourceContact,
             sender_name: senderName,
@@ -71,6 +72,18 @@ async function logMessage({ sourceGroup, sourceContact, senderName, messageText,
     } catch (err) {
         console.error('[DB] Failed to log message:', err.message);
     }
+}
+
+async function messageAlreadyProcessed(waMessageId) {
+    if (!waMessageId) return false;
+    const { data, error } = await supabase
+        .from('message_log')
+        .select('id')
+        .eq('wa_message_id', waMessageId)
+        .limit(1)
+        .maybeSingle();
+    if (error) return false;
+    return !!data;
 }
 
 // ============================================================
@@ -249,6 +262,7 @@ module.exports = {
     getGroupUpdates,
     seedGroups,
     logMessage,
+    messageAlreadyProcessed,
     computeRequestHash,
     saveRequest,
     findMatches,

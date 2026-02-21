@@ -12,7 +12,7 @@ require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { parseMessage } = require('./parser');
-const { saveRequest, logMessage, getStats, loadMonitoredGroups, getGroupUpdates, seedGroups } = require('./db');
+const { saveRequest, logMessage, messageAlreadyProcessed, getStats, loadMonitoredGroups, getGroupUpdates, seedGroups } = require('./db');
 const { processRequest, formatMatch } = require('./matcher');
 
 const monitoredGroupIds = new Set();
@@ -22,6 +22,10 @@ const GROUP_POLL_INTERVAL = 60 * 1000;
 const processedMessages = new Set();
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 5;
+
+// Backfill: fetch missed messages when reconnecting (env: BACKFILL_HOURS, BACKFILL_LIMIT)
+const BACKFILL_HOURS = parseInt(process.env.BACKFILL_HOURS || '24', 10);
+const BACKFILL_LIMIT = parseInt(process.env.BACKFILL_LIMIT || '50', 10);
 
 function createClient() {
     return new Client({
@@ -58,6 +62,93 @@ async function refreshMonitoredGroups() {
     monitoredGroupIds.clear();
     groups.forEach(g => monitoredGroupIds.add(g.group_id));
     return groups.length;
+}
+
+async function processOneMessage(msg, chat, contact, senderName, senderNumber, body, isBackfill = false) {
+    const msgId = msg.id._serialized;
+    if (processedMessages.has(msgId)) return;
+    processedMessages.add(msgId);
+
+    const parsed = await parseMessage(body, senderName);
+
+    await logMessage({
+        waMessageId: msgId,
+        sourceGroup: chat.name,
+        sourceContact: senderNumber,
+        senderName,
+        messageText: body,
+        isRequest: parsed.isRequest || false,
+        parsedData: parsed,
+        error: parsed._error || null
+    });
+
+    if (!parsed.isRequest) return;
+
+    const request = await saveRequest({
+        source: 'whatsapp',
+        sourceGroup: chat.name,
+        sourceContact: senderNumber,
+        type: parsed.type,
+        category: parsed.category,
+        date: parsed.date,
+        origin: parsed.origin,
+        destination: parsed.destination,
+        details: parsed.details || {},
+        rawMessage: body
+    });
+
+    if (!request) return;
+
+    const matches = await processRequest(request);
+    if (matches.length > 0) {
+        console.log(`[Bot] ${matches.length} match(es)!`);
+        matches.forEach(m => console.log('\n' + formatMatch(m)));
+    }
+}
+
+async function backfillOnReady(chats) {
+    if (monitoredGroupIds.size === 0) return;
+
+    const monitoredChats = chats.filter(c => c.isGroup && monitoredGroupIds.has(c.id._serialized));
+    if (monitoredChats.length === 0) return;
+
+    const since = Date.now() - BACKFILL_HOURS * 60 * 60 * 1000;
+    let totalFetched = 0;
+    let totalProcessed = 0;
+
+    console.log(`\n[Bot] Backfill: fetching last ${BACKFILL_LIMIT} messages per group (last ${BACKFILL_HOURS}h)...`);
+
+    for (const chat of monitoredChats) {
+        try {
+            const messages = await chat.fetchMessages({ limit: BACKFILL_LIMIT });
+            const recent = messages.filter(m => m.timestamp * 1000 >= since && m.body && m.body.length >= 3);
+            totalFetched += recent.length;
+
+            for (const msg of recent) {
+                const alreadyDone = await messageAlreadyProcessed(msg.id._serialized);
+                if (alreadyDone) continue;
+
+                try {
+                    const contact = await msg.getContact();
+                    const senderName = contact.pushname || contact.name || 'Unknown';
+                    const senderNumber = contact.id?.user || msg.author || msg.from;
+                    const body = msg.body;
+                    if (!body) continue;
+
+                    await processOneMessage(msg, chat, contact, senderName, senderNumber, body, true);
+                    totalProcessed++;
+                } catch (err) {
+                    console.error(`[Bot] Backfill error for msg:`, err.message);
+                }
+            }
+        } catch (err) {
+            console.error(`[Bot] Backfill fetch error for ${chat.name}:`, err.message);
+        }
+    }
+
+    if (totalFetched > 0 || totalProcessed > 0) {
+        console.log(`[Bot] Backfill done: ${totalFetched} recent messages, ${totalProcessed} new ones processed\n`);
+    }
 }
 
 let client = createClient();
@@ -99,13 +190,15 @@ client.on('ready', async () => {
 
     const stats = await getStats();
     console.log(`[Bot] DB: ${stats.total} requests (${stats.open} open, ${stats.matched} matched)\n`);
+
+    // Backfill: fetch recent messages we may have missed while offline
+    if (monitoredGroupIds.size > 0) {
+        await backfillOnReady(chats);
+    }
 });
 
 client.on('message', async (msg) => {
     try {
-        if (processedMessages.has(msg.id._serialized)) return;
-        processedMessages.add(msg.id._serialized);
-
         const chat = await msg.getChat();
         if (!chat.isGroup) return;
 
@@ -121,47 +214,7 @@ client.on('message', async (msg) => {
 
         console.log(`\n[${chat.name}] ${senderName}: ${body.substring(0, 60)}${body.length > 60 ? '...' : ''}`);
 
-        const parsed = await parseMessage(body, senderName);
-
-        await logMessage({
-            sourceGroup: chat.name,
-            sourceContact: senderNumber,
-            senderName,
-            messageText: body,
-            isRequest: parsed.isRequest || false,
-            parsedData: parsed,
-            error: parsed._error || null
-        });
-
-        if (!parsed.isRequest) {
-            console.log('[Bot] Not a request');
-            return;
-        }
-
-        const request = await saveRequest({
-            source: 'whatsapp',
-            sourceGroup: chat.name,
-            sourceContact: senderNumber,
-            type: parsed.type,
-            category: parsed.category,
-            date: parsed.date,
-            origin: parsed.origin,
-            destination: parsed.destination,
-            details: parsed.details || {},
-            rawMessage: body
-        });
-
-        if (!request) {
-            return;
-        }
-
-        const matches = await processRequest(request);
-
-        if (matches.length > 0) {
-            console.log(`[Bot] ${matches.length} match(es)!`);
-            matches.forEach(m => console.log('\n' + formatMatch(m)));
-        }
-
+        await processOneMessage(msg, chat, contact, senderName, senderNumber, body);
     } catch (error) {
         console.error('[Bot] Error:', error.message);
     }
