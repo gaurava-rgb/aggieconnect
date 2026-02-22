@@ -61,6 +61,11 @@ Today is ${dayName}, ${today}. Resolve relative dates:
 - "Friday" -> the upcoming Friday
 - "this weekend" -> upcoming Saturday
 
+If the message contains BOTH a relative date AND an explicit date, ALWAYS use the explicit date.
+- "tomorrow (feb 22)" -> 2026-02-22 (use the explicit date, NOT "tomorrow")
+- "this friday (feb 28)" -> 2026-02-28 (use the explicit date)
+- "next week monday" -> resolve normally (no explicit date given)
+
 Normalize destinations:
 - "Houston airport" / "IAH" / "Bush" -> "Houston IAH"
 - "Hobby" -> "Houston Hobby"
